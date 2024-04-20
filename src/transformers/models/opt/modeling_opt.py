@@ -14,7 +14,7 @@
 # limitations under the License.
 """ PyTorch OPT model."""
 from typing import List, Optional, Tuple, Union
-
+import logging
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -133,6 +133,18 @@ class OPTAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
 
+        ## H20 Implementation
+        heavy_ratio = 0.85
+        self.layer = [14,15,16,17,18,19,20,21,22,23]
+        self.heavy_budget_ratio = heavy_ratio
+        self.prompt = True
+        self.heavy_budget = None
+     
+
+    def _reset(self):
+        self.prompt = True
+        self.heavy_budget = None
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -144,6 +156,7 @@ class OPTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        layer_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -151,8 +164,8 @@ class OPTAttention(nn.Module):
         # for the decoder
         is_cross_attention = key_value_states is not None
 
-        bsz, tgt_len, _ = hidden_states.size()
-
+        bsz, tgt_len, hidden_size = hidden_states.size()
+        
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
@@ -166,12 +179,14 @@ class OPTAttention(nn.Module):
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
             # reuse k, v, self_attention
+            self.prompt = False
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
             # self_attention
+            self._reset()
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
@@ -210,11 +225,79 @@ class OPTAttention(nn.Module):
             )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
+
+        
+        ##----------------------
+        # if self.attention_masks_next is not None:
+        #     attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
+        ##----------------------
+
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        
+        ## H20-------------------------------------------------------------
+        # attn_weights (bs * heads, q-tokens, k-tokens) 16, 15, 15 // 16, 1, 16
+        if self.prompt == True and layer_index in self.layer:
+            current_scores_sum = attn_weights.sum(1) # (bs * heads, k-tokens)
+            self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
+
+            ## Keep the special tokens
+            # current_scores_sum[:, 0] = torch.finfo(current_scores_sum.dtype).max
+            # current_scores_sum[:, -1]= torch.finfo(current_scores_sum.dtype).max
+
+            _, keep_topk = current_scores_sum.topk(k = self.heavy_budget, dim = -1, largest = True, sorted = True)
+
+            new_key_states = torch.zeros(keep_topk.shape[0], self.heavy_budget, self.head_dim).to(key_states.dtype).to(key_states.device)
+            new_value_states = torch.zeros(keep_topk.shape[0], self.heavy_budget, self.head_dim).to(value_states.dtype).to(value_states.device)
+
+            for i in range(keep_topk.shape[0]):
+                new_key_states[i] = key_states[i,keep_topk[i],:].contiguous()
+                new_value_states[i] = value_states[i,keep_topk[i],:].contiguous()
+
+            new_key_states = new_key_states.view(bsz, self.num_heads, -1, self.head_dim).contiguous()
+            new_value_states = new_value_states.view(bsz, self.num_heads, -1, self.head_dim).contiguous()
+            
+            past_key_value = (new_key_states, new_value_states)
+
+        # if not self.previous_scores == None:
+        #     current_scores_sum[:, :-1] += self.previous_scores #(Enlarge Sequence)
+        # else:
+        #     self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
+        #     self.recent_budget = int(self.recent_budget_ratio * current_scores_sum.shape[-1])
+        #     self.cache_budget = self.heavy_budget + self.recent_budget
+        #     self.cache_budget_records.append(self.cache_budget)
+        #     self.input_length.append(attn_weights.shape[-1])
+        # dtype_attn_weights = attn_weights.dtype
+        # attn_weights_devices = attn_weights.device
+
+        # self.previous_scores = current_scores_sum #(heads, k-tokens)
+        
+        # attn_mask = torch.ones(current_scores_sum.shape[0], current_scores_sum.shape[1]+1).to(dtype_attn_weights).to(attn_weights_devices)
+
+        # attn_tokens_all = self.previous_scores.shape[-1]
+        # if attn_tokens_all > self.cache_budget:
+        #     # activate most recent k-cache
+        #     if not self.recent_budget == 0:
+        #         attn_mask[:, :-self.recent_budget] = 0
+        #         selected_set = self.previous_scores[:, :-self.recent_budget]
+        #     else:
+        #         # activate historical best self.cache_budget - self.recent_budget tokens.
+        #         # self.previous_scores # (k-Cache - 1)
+        #         selected_set = self.previous_scores
+
+        #     if not self.heavy_budget == 0:
+        #         _, keep_topk = selected_set.topk(k=self.heavy_budget, dim=-1, largest=True)
+        #         attn_mask = attn_mask.scatter(-1, keep_topk, 1)
+
+        # self.attention_masks_next = attn_mask.unsqueeze(1)
+
+        # score_mask = attn_mask[:,:-1]
+        # score_mask[:, -self.recent_budget:] = 1
+        # self.previous_scores = self.previous_scores * score_mask
+        ##-----------------------------------------------------------------
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -500,6 +583,7 @@ class OPTDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        layer_index: Optional[int] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -530,6 +614,7 @@ class OPTDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            layer_index=layer_index,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -890,9 +975,18 @@ class OPTDecoder(OPTPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    layer_index=idx,
                 )
 
             hidden_states = layer_outputs[0]
+
+            if idx < len(self.layers) - 1:
+                past_key_values_length = past_key_values[idx + 1][0].shape[2] if past_key_values is not None else 0
+                mask_seq_length = past_key_values_length + seq_length
+                attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+                causal_attention_mask = _prepare_4d_causal_attention_mask(
+                    attention_mask, input_shape, inputs_embeds, past_key_values_length
+                )
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -966,7 +1060,7 @@ class OPTModel(OPTPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+  
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=input_ids,
